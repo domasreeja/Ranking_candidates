@@ -1,82 +1,3 @@
-#!/usr/bin/env python3
-"""
-Redrob Hackathon - Intelligent Candidate Discovery & Ranking
-=============================================================
-
-Approach
---------
-A great recruiter doesn't grep for keywords. They read a profile, build a
-mental model of "what has this person actually done", and check that against
-"what does this role actually need" -- including the unstated parts (services
-vs product company, title-chasing, recency of hands-on work, location /
-availability realities).
-
-This script encodes that reasoning as an explicit, inspectable feature
-pipeline -- no hosted LLM calls, no GPU, pure CPU, runs in seconds even on
-100K candidates.
-
-Pipeline
---------
-1. SEMANTIC FIT (TF-IDF cosine similarity, local & precomputable)
-   - Compares the JD's narrative text against each candidate's FULL career
-     narrative (summary + every role's description), NOT just their skills
-     list. This is the key anti-keyword-stuffing move: a candidate whose
-     *skills* say "RAG, Pinecone, LLM fine-tuning" but whose *career history*
-     never describes doing that work gets a low semantic score, because the
-     descriptions don't textually resemble the JD's "what you'd actually be
-     doing" section.
-
-2. CAREER-SUBSTANCE SIGNALS (rule-based, derived from career_history)
-   - Production retrieval/ranking/embeddings/vector-DB experience, detected
-     in role *descriptions* (not skills) -> the JD's #1 "absolutely need".
-   - Services-company penalty (TCS/Infosys/Wipro/Accenture/Cognizant/
-     Capgemini) unless there's also product-company experience.
-   - Title-chaser detection: rapid title escalation across short (<18mo)
-     tenures -> explicit JD disqualifier.
-   - "Architecture/tech-lead drift" detection: most recent role title
-     suggests the candidate stopped writing code.
-   - Recent-LangChain-only detection: <12mo of LLM-wrapper experience with
-     no pre-LLM production ML/data history.
-   - Pure-research / no production deployment detection.
-   - Years-of-experience fit around the JD's 5-9y band (soft, triangular).
-
-3. LOCATION / LOGISTICS FIT
-   - Tier-1 Indian city match, relocation flag, work-mode alignment with the
-     JD's hybrid Pune/Noida ask, notice period vs the JD's <=30 day ask.
-
-4. BEHAVIORAL-SIGNAL MULTIPLIER (redrob_signals)
-   - A perfect-on-paper-but-dormant candidate is downweighted. Built as a
-     0.55-1.0 multiplier from: recency of activity, open_to_work flag,
-     recruiter_response_rate, interview_completion_rate, profile
-     completeness, and verification flags. This is a MULTIPLIER, not an
-     additive score, per the JD's explicit instruction ("down-weight them
-     appropriately").
-
-5. HONEYPOT / IMPOSSIBLE-PROFILE DETECTION
-   - Flags profiles with internally inconsistent claims (e.g. a skill used
-     longer than the candidate's total tenure at the company where they
-     claim to use it, "expert" proficiency with ~0 duration_months, or a
-     career-history entry whose duration exceeds the company's plausible
-     existence given context). Flagged candidates are pushed to the bottom
-     via a heavy score penalty rather than removed outright (keeps the
-     scorer's behaviour inspectable / debuggable).
-
-6. REASONING GENERATION
-   - Built entirely from the candidate's own fields (years of experience,
-     current title, specific matched evidence phrases from their career
-     descriptions, location, notice period, response rate, any honeypot /
-     red flags). No templates that just splice in a name; no claims about
-     skills that aren't actually present in the candidate's data.
-
-Final score = semantic_fit (0-1)
-            * behavioral_multiplier (0.55-1.0)
-            + career_substance_bonus (0 - 0.6, additive, capped)
-            - penalties (services-only, title-chaser, etc.)
-            then clipped to [0,1] and honeypots forced near 0.
-
-Output: top-100 CSV (candidate_id, rank, score, reasoning), score
-non-increasing by rank, ties broken by candidate_id ascending.
-"""
 
 import json
 import re
@@ -89,42 +10,8 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ---------------------------------------------------------------------------
-# Config / JD-derived knowledge (hand-encoded from job_description.docx)
-# ---------------------------------------------------------------------------
+---------------------------------------------------------------------
 
-JD_TEXT = """
-Senior AI Engineer, Founding Team, AI-native talent intelligence platform.
-Own the intelligence layer: ranking, retrieval, and matching systems that
-decide what recruiters see when they search for candidates and what
-candidates see when they search for roles. Audit existing BM25 plus
-rule-based scoring and identify the highest leverage fixes. Ship a v2 ranking
-system using embeddings, hybrid retrieval, and LLM based re-ranking that
-improves recruiter engagement metrics. Set up offline benchmarks (NDCG, MRR,
-MAP), online A and B testing, and recruiter feedback loops. Drive long term
-architecture for candidate to job matching at scale, mentor engineers, work
-closely with product. Production experience with embeddings based retrieval
-systems such as sentence transformers, OpenAI embeddings, BGE, or E5 deployed
-to real users, handling embedding drift, index refresh, and retrieval quality
-regression. Production experience with vector databases or hybrid search
-infrastructure such as Pinecone, Weaviate, Qdrant, Milvus, OpenSearch,
-Elasticsearch, or FAISS. Strong Python and code quality. Hands on experience
-designing evaluation frameworks for ranking systems including NDCG, MRR, MAP,
-offline to online correlation, and A/B test interpretation. Nice to have: LLM
-fine tuning with LoRA, QLoRA, PEFT; learning to rank models such as XGBoost or
-neural rankers; prior exposure to HR tech, recruiting tech, or marketplace
-products; distributed systems or large scale inference optimization;
-open source contributions. Scrappy product engineering attitude, willing to
-ship a working ranker quickly. Ideal candidate has six to eight years total
-experience, four to five years in applied ML or AI roles at product
-companies, has shipped an end to end ranking, search, or recommendation
-system to real users at meaningful scale, has opinions about hybrid
-retrieval, offline versus online evaluation, and when to fine tune versus
-prompt, defended with reference to systems actually built.
-"""
-
-# Tokens that indicate genuinely hands-on retrieval/ranking/ML-infra work
-# (used against career_history descriptions, not just the skills list)
 CORE_SUBSTANCE_PATTERNS = [
     r"\bembedding", r"\bvector (db|database|index|store|search)",
     r"\bsentence[- ]transformers?\b", r"\bbge\b", r"\be5\b",
